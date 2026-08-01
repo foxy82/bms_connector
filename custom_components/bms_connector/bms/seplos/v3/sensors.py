@@ -107,9 +107,19 @@ async def generate_sensors(hass, bms_type, connector_info, config_battery_addres
                 "No response from configured address 0x%02X — scanning for BMS...",
                 addr_int
             )
-            discovered = await hass.async_add_executor_job(
-                discover_bms_address, v3_send_serial_command, serial_port, serial_baud
-            )
+            # Scan with whichever transport is actually in use. discover_bms_address
+            # calls send_fn(cmds, arg2, arg3) positionally, which lines up with
+            # send_telnet_command(commands, host, port) as well as the serial form.
+            if connector_type == "telnet":
+                discovered = await hass.async_add_executor_job(
+                    discover_bms_address, v3_send_telnet_command,
+                    telnet_host, telnet_port
+                )
+            else:
+                discovered = await hass.async_add_executor_job(
+                    discover_bms_address, v3_send_serial_command,
+                    serial_port, serial_baud
+                )
             if discovered is not None and discovered != addr_int:
                 _LOGGER.warning(
                     "BMS found at address 0x%02X (configured was 0x%02X) — "

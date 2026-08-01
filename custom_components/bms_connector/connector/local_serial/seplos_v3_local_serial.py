@@ -11,9 +11,9 @@ RS485 half-duplex handling:
 
 import serial
 import logging
+import socket
 import struct
 import time
-import telnetlib
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -264,81 +264,111 @@ def send_serial_command(commands, port, baudrate=19200, timeout=2):
     return responses
 
 
+
 # ---------------------------------------------------------------------------
-# Telnet transport
+# TCP ("Telnet") transport
 # ---------------------------------------------------------------------------
+
+class _SocketReader:
+    """Adapt a socket to the ``.read(n)`` interface _read_modbus_frame expects.
+
+    Reads are bounded by an absolute deadline, so a bus that keeps producing
+    bytes cannot hold a Home Assistant executor thread open indefinitely.
+    """
+
+    def __init__(self, sock, deadline: float):
+        self._sock = sock
+        self._deadline = deadline
+        self._buf = bytearray()
+
+    def read(self, n: int = 1) -> bytes:
+        while len(self._buf) < n:
+            remaining = self._deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self._sock.settimeout(min(remaining, 0.5))
+            try:
+                chunk = self._sock.recv(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if not chunk:
+                break
+            self._buf.extend(chunk)
+        out = bytes(self._buf[:n])
+        del self._buf[:n]
+        return out
+
 
 def send_telnet_command(commands: list[str], host: str, port: int = 23,
                         timeout: int = 8) -> list[str]:
-    """Send Modbus RTU commands via Telnet and return hex-string responses.
+    """Send Modbus RTU commands over TCP and return hex-string responses.
 
-    Telnet is full-duplex so there is no RS485 echo to consume. Responses
-    are read with silence detection (900ms of no data = end of frame).
+    Responses are located with the same byte-level frame synchronisation the
+    serial transport uses: sync on ``[addr, 0x04, LEN]``, validate CRC, and
+    skip frames belonging to another address or table. Unrelated traffic on
+    the bus is discarded rather than returned.
 
     Args:
         commands:  List of hex strings, each a complete Modbus RTU command.
-        host:      Telnet server address.
-        port:      Telnet server port (default 23).
-        timeout:   Per-command silence-detection timeout (default 8s).
+        host:      Gateway address.
+        port:      Gateway port (default 23).
+        timeout:   Per-command deadline in seconds (default 8).
 
     Returns:
-        List of hex strings. One element per command — empty string if
-        a response could not be obtained.
+        List of hex strings. One element per command -- empty string if a
+        valid response could not be obtained.
 
     """
-    responses = []
+    responses: list[str] = []
     _LOGGER.debug("send_telnet_command: connecting to %s:%s", host, port)
 
+    sock = None
     try:
-        tn = telnetlib.Telnet(host, port, timeout=5)
+        sock = socket.create_connection((host, port), timeout=5)
 
-        try:
-            for command in commands:
-                _LOGGER.debug("Sending: %s", command)
+        for command in commands:
+            try:
+                cmd_bytes = bytes.fromhex(command)
+            except ValueError as e:
+                _LOGGER.error("Invalid command: %s - %s", command, e)
+                responses.append("")
+                continue
 
-                try:
-                    cmd_bytes = bytes.fromhex(command)
-                except Exception as e:
-                    _LOGGER.error("Invalid command: %s — %s", command, e)
-                    responses.append("")
-                    continue
+            expected_addr = cmd_bytes[0]
+            expected_data_len = _expected_data_len(command)
 
-                tn.write(cmd_bytes)
-                _LOGGER.debug("Sent telnet raw (%d bytes): %s", len(cmd_bytes), cmd_bytes.hex())
-                time.sleep(0.5)
+            sock.sendall(cmd_bytes)
+            _LOGGER.debug("Sent raw (%d bytes): %s",
+                          len(cmd_bytes), cmd_bytes.hex())
 
-                # Receive with silence detection
-                chunks = []
-                last_data = time.monotonic()
-                deadline = last_data + timeout
+            reader = _SocketReader(sock, time.monotonic() + timeout)
+            raw = _read_modbus_frame(
+                reader, expected_addr, expected_data_len,
+                sync_timeout=timeout,
+            )
 
-                while time.monotonic() < deadline:
-                    try:
-                        chunk = tn.read_very_eager()
-                        if chunk:
-                            chunks.append(chunk)
-                            last_data = time.monotonic()
-                        else:
-                            if time.monotonic() - last_data > 0.9:
-                                break
-                    except EOFError:
-                        break
+            if raw:
+                _LOGGER.debug("Response OK addr=0x%02X (%d bytes): %s",
+                              expected_addr, len(raw), raw.hex())
+                responses.append(raw.hex())
+            else:
+                _LOGGER.warning(
+                    "No valid frame for addr=0x%02X - check the BMS address "
+                    "and that the gateway forwards RS485 continuously",
+                    expected_addr,
+                )
+                responses.append("")
 
-                    time.sleep(0.03)
-
-                raw = b"".join(chunks)
-                response = raw.hex()
-                if raw:
-                    _LOGGER.debug("Telnet response (%d bytes): %s", len(raw), response)
-                else:
-                    _LOGGER.warning("Telnet empty response — check wiring and BMS address")
-                responses.append(response)
-
-        finally:
-            tn.close()
-
-    except Exception as e:
-        _LOGGER.error("Telnet error on %s:%s — %s", host, port, e)
+    except OSError as e:
+        _LOGGER.error("TCP error on %s:%s - %s", host, port, e)
         return [""] * len(commands)
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
     return responses

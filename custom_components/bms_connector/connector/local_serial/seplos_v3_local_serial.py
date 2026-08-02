@@ -20,8 +20,10 @@ _LOGGER = logging.getLogger(__name__)
 # Known data-byte counts for V3 Modbus responses, per function code.
 # 0x04 read input registers — PIA 18 regs x 2 = 36 = 0x24
 #                             PIB 26 regs x 2 = 52 = 0x34
+# 0x01 read coils           — PIC 144 coils / 8 = 18 = 0x12
 _VALID_DATA_LENS_BY_FUNCTION = {
     0x04: (0x24, 0x34),
+    0x01: (0x12,),
 }
 _VALID_DATA_LENS = (0x24, 0x34)
 
@@ -71,12 +73,15 @@ def _command_function_code(command_hex: str) -> int:
 def _expected_data_len(command_hex: str) -> int:
     """Derive the expected response data byte count from a Modbus command.
 
-    A Read Input Registers command (0x04) has the register count at
-    bytes [4:6] (big-endian). Each register is 2 bytes → data_len = count * 2.
+    The quantity requested sits at bytes [4:6] (big-endian) for both function
+    codes used here. Read Input Registers (0x04) returns 2 bytes per register;
+    Read Coils (0x01) packs 8 coils into each byte.
     """
     try:
         raw = bytes.fromhex(command_hex)
         count = (raw[4] << 8) | raw[5]
+        if raw[1] == 0x01:
+            return (count + 7) // 8
         return count * 2
     except Exception:
         return 0

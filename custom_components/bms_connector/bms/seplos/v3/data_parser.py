@@ -79,6 +79,102 @@ def build_commands_for_address(battery_addr: int) -> list:
 
 
 # ---------------------------------------------------------------------------
+# PIC — status, alarm and equalisation flags (0x01 read coils)
+# ---------------------------------------------------------------------------
+
+# PIC occupies 0x1200-0x128F: 18 documented rows of 8 bits each.
+PIC_START = 0x1200
+PIC_COILS = 144
+PIC_RESPONSE_DATA_BYTES = PIC_COILS // 8
+
+# Byte offset within the PIC payload -> attribute name.
+PIC_BYTES = {
+    0: "cells_01_08_undervoltage_alarm",
+    1: "cells_09_16_undervoltage_alarm",
+    2: "cells_01_08_overvoltage_alarm",
+    3: "cells_09_16_overvoltage_alarm",
+    4: "cell_temperature_low_alarm",
+    5: "cell_temperature_high_alarm",
+    6: "equalization_cells_01_08",
+    7: "equalization_cells_09_16",
+    8: "system_state_code",
+    9: "voltage_event_code",
+    10: "cell_temperature_event_code",
+    11: "environment_power_temperature_event_code",
+    12: "current_event_code_1",
+    13: "current_event_code_2",
+    14: "residual_capacity_code",
+    15: "fet_event_code",
+    16: "battery_equalization_state_code",
+    17: "hard_fault_event_code",
+}
+
+
+def build_pic_command(battery_addr: int) -> str:
+    """Build the PIC command (0x01 read coils) for a given battery address."""
+    payload = bytes([battery_addr, 0x01]) + struct.pack('>HH', PIC_START, PIC_COILS)
+    crc = modbus_crc(payload)
+    cmd = (payload + crc).hex()
+    _LOGGER.debug("PIC command built: %s (addr=0x%02X)", cmd, battery_addr)
+    return cmd
+
+
+class V3PICTableData:
+    """Decoded PIC flags for one pack."""
+
+    def __init__(self, payload: bytes):
+        for offset, name in PIC_BYTES.items():
+            setattr(self, name, payload[offset] if offset < len(payload) else 0)
+
+    @property
+    def balancing_cells(self) -> list:
+        """Cell numbers (1-16) currently equalising."""
+        cells = []
+        for bit in range(8):
+            if self.equalization_cells_01_08 >> bit & 1:
+                cells.append(bit + 1)
+            if self.equalization_cells_09_16 >> bit & 1:
+                cells.append(bit + 9)
+        return sorted(cells)
+
+    @property
+    def balancing_cell_count(self) -> int:
+        return len(self.balancing_cells)
+
+
+def extract_pic_from_message(response_hex: str, config_battery_address: int = None):
+    """Decode a PIC coil response into a V3PICTableData, or None.
+
+    Returns None when the response is absent, malformed, addressed to another
+    pack, or fails CRC, so a BMS that does not serve PIC yields no flags
+    rather than disturbing the rest of the update.
+    """
+    if not response_hex:
+        return None
+    try:
+        raw = bytes.fromhex(response_hex)
+    except ValueError:
+        _LOGGER.debug("PIC response is not valid hex")
+        return None
+
+    if len(raw) < 3 + PIC_RESPONSE_DATA_BYTES + 2:
+        _LOGGER.debug("PIC response too short: %d bytes", len(raw))
+        return None
+    if raw[1] != 0x01 or raw[2] != PIC_RESPONSE_DATA_BYTES:
+        _LOGGER.debug("PIC response has unexpected header: %s", raw[:3].hex())
+        return None
+    if config_battery_address is not None and raw[0] != config_battery_address:
+        _LOGGER.debug("PIC response from 0x%02X, expected 0x%02X",
+                      raw[0], config_battery_address)
+        return None
+    if modbus_crc(raw[:-2]) != raw[-2:]:
+        _LOGGER.debug("PIC response CRC mismatch")
+        return None
+
+    return V3PICTableData(raw[3:3 + PIC_RESPONSE_DATA_BYTES])
+
+
+# ---------------------------------------------------------------------------
 # BMS address discovery
 # ---------------------------------------------------------------------------
 

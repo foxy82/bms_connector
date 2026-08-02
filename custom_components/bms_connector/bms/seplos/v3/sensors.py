@@ -2,8 +2,15 @@ from homeassistant.components.sensor import SensorEntity, SensorDeviceClass, Sen
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.const import EntityCategory
 
-from .data_parser import extract_data_from_message, build_commands_for_address, discover_bms_address
+from .data_parser import (
+    extract_data_from_message,
+    build_commands_for_address,
+    build_pic_command,
+    extract_pic_from_message,
+    discover_bms_address,
+)
 from ....connector.local_serial.seplos_v3_local_serial import send_serial_command as v3_send_serial_command
 from ....connector.local_serial.seplos_v3_local_serial import send_telnet_command as v3_send_telnet_command
 import logging
@@ -61,7 +68,8 @@ def parse_battery_addresses(config_battery_address):
 # ---------------------------------------------------------------------------
 
 async def generate_sensors(hass, bms_type, connector_info, config_battery_address,
-                            sensor_prefix, entry_id, async_add_entities, poll_interval=10):
+                            sensor_prefix, entry_id, async_add_entities, poll_interval=10,
+                            read_status_flags=False):
     """Génère et enregistre les capteurs pour une ou plusieurs batteries.
 
     config_battery_address accepte une adresse unique ("1", "0x01", 1) ou une
@@ -115,6 +123,9 @@ async def generate_sensors(hass, bms_type, connector_info, config_battery_addres
         commands = []
         for addr in active_addresses:
             commands.extend(build_commands_for_address(addr))
+            if read_status_flags:
+                commands.append(build_pic_command(addr))
+        stride = 3 if read_status_flags else 2
         _LOGGER.debug(
             "Polling %d battery address(es) %s using %d commands",
             len(active_addresses), [hex(a) for a in active_addresses], len(commands)
@@ -189,18 +200,22 @@ async def generate_sensors(hass, bms_type, connector_info, config_battery_addres
         # l'ordre d'envoi, donc la paire de l'adresse i est à l'offset i*2.
         results = {}
         for index, addr in enumerate(active_addresses):
-            pair = telemetry_data_str[index * 2:index * 2 + 2]
-            if len(pair) < 2 or not pair[0]:
+            chunk = telemetry_data_str[index * stride:index * stride + stride]
+            if len(chunk) < 2 or not chunk[0]:
                 _LOGGER.warning("No valid response from battery 0x%02X", addr)
-                results[addr] = (None, None, None, None, None)
+                results[addr] = (None, None, None, None, None, None)
                 continue
-            results[addr] = extract_data_from_message(
-                pair,
+            parsed = extract_data_from_message(
+                chunk[:2],
                 telemetry_requested=True,
                 teledata_requested=True,
                 debug=True,
                 config_battery_address=addr,
             )
+            pic = None
+            if read_status_flags and len(chunk) > 2:
+                pic = extract_pic_from_message(chunk[2], config_battery_address=addr)
+            results[addr] = tuple(parsed) + (pic,)
 
         # Mono-adresse : renvoie le tuple directement, multi-adresse : le
         # dictionnaire indexé par adresse Modbus.
@@ -394,7 +409,39 @@ async def generate_sensors(hass, bms_type, connector_info, config_battery_addres
             ),
         ]
 
-        sensors += pia_sensors + pib_sensors
+        pic_sensors = []
+        if read_status_flags:
+            pic_sensors = [
+                BalancingCellsSensor(
+                    coordinator, connector_info, "balancing_cell_count",
+                    "Balancing Cells", None, "mdi:scale-balance",
+                    battery_address=battery_address, sensor_prefix=sensor_prefix,
+                    entry_id=entry_id, modbus_address=_mb, multi_pack=multi_pack,
+                    diagnostic=True
+                )
+            ] + [
+                SeplosBMSSensorBase(
+                    coordinator, connector_info, attribute, name, None, icon,
+                    battery_address=battery_address, sensor_prefix=sensor_prefix,
+                    entry_id=entry_id, modbus_address=_mb, multi_pack=multi_pack,
+                    diagnostic=True
+                )
+                for attribute, name, icon in (
+                    ("system_state_code", "System State Code", "mdi:state-machine"),
+                    ("fet_event_code", "FET State Code", "mdi:electric-switch"),
+                    ("voltage_event_code", "Voltage Event Code", "mdi:alert-circle-outline"),
+                    ("cell_temperature_event_code", "Cell Temperature Event Code",
+                     "mdi:alert-circle-outline"),
+                    ("environment_power_temperature_event_code",
+                     "Environment/Power Temperature Event Code", "mdi:alert-circle-outline"),
+                    ("current_event_code_1", "Current Event Code 1", "mdi:alert-circle-outline"),
+                    ("current_event_code_2", "Current Event Code 2", "mdi:alert-circle-outline"),
+                    ("residual_capacity_code", "Residual Capacity Code", "mdi:battery-alert"),
+                    ("hard_fault_event_code", "Hard Fault Event Code", "mdi:alert-octagon"),
+                )
+            ]
+
+        sensors += pia_sensors + pib_sensors + pic_sensors
 
     async_add_entities(sensors, True)
 
@@ -418,8 +465,10 @@ class SeplosBMSSensorBase(CoordinatorEntity, SensorEntity):
 
     def __init__(self, coordinator, port, attribute, name, unit=None,
                  icon=None, battery_address=None, sensor_prefix=None, entry_id=None,
-                 modbus_address=None, multi_pack=False):
+                 modbus_address=None, multi_pack=False, diagnostic=False):
         super().__init__(coordinator)
+        if diagnostic:
+            self._attr_entity_category = EntityCategory.DIAGNOSTIC
         # Entity name already includes prefix; prevent HA 2024+ from doubling.
         self._attr_has_entity_name = False
         self._port = port
@@ -520,11 +569,13 @@ class SeplosBMSSensorBase(CoordinatorEntity, SensorEntity):
         pack_data = self._pack_data()
 
         if isinstance(pack_data, tuple):
-            battery_address_data, pia_data, pib_data, system_details_data, protection_settings_data = \
-                pack_data
+            pia_data, pib_data = pack_data[1], pack_data[2]
+            system_details_data, protection_settings_data = pack_data[3], pack_data[4]
+            pic_data = pack_data[5] if len(pack_data) > 5 else None
             # Cherche dans PIA, puis PIB, puis les autres objets
             # Utilise _MISSING comme sentinel pour distinguer "absent" de "valeur 0"
-            for data_obj in (pia_data, pib_data, system_details_data, protection_settings_data):
+            for data_obj in (pia_data, pib_data, system_details_data,
+                             protection_settings_data, pic_data):
                 result = self.get_value(data_obj)
                 if result is not _MISSING:
                     value = result
@@ -581,3 +632,15 @@ class SeplosBMSSensorBase(CoordinatorEntity, SensorEntity):
     @property
     def icon(self):
         return self._icon
+
+
+class BalancingCellsSensor(SeplosBMSSensorBase):
+    """Number of cells currently equalising, with the cell list as an attribute."""
+
+    @property
+    def extra_state_attributes(self):
+        pack_data = self._pack_data()
+        pic = pack_data[5] if isinstance(pack_data, tuple) and len(pack_data) > 5 else None
+        if pic is None:
+            return None
+        return {"balancing_cells": pic.balancing_cells}

@@ -15,3 +15,6 @@ coverage.xml
 # Home Assistant configuration
 config/*
 !config/configuration.yaml
+
+# Locally built release artifact
+custom_components/bms_connector/bms_connector.zip

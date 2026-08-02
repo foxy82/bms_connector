@@ -18,9 +18,10 @@ import telnetlib
 _LOGGER = logging.getLogger(__name__)
 
 # Known data-byte counts for V3 Modbus responses
-# PIA : 18 registers x 2 = 36 = 0x24
-# PIB : 26 registers x 2 = 52 = 0x34
-_VALID_DATA_LENS = (0x24, 0x34)
+# PIA : 18 registers x 2 = 36 = 0x24   (0x04 read input registers)
+# PIB : 26 registers x 2 = 52 = 0x34   (0x04 read input registers)
+# PIC : 144 coils / 8    = 18 = 0x12   (0x01 read coils)
+_VALID_DATA_LENS = (0x12, 0x24, 0x34)
 
 # ---------------------------------------------------------------------------
 # CRC-16 Modbus
@@ -55,22 +56,35 @@ def _frame_crc_ok(frame: bytes) -> bool:
 def _expected_data_len(command_hex: str) -> int:
     """Derive the expected response data byte count from a Modbus command.
 
-    A Read Input Registers command (0x04) has the register count at
-    bytes [4:6] (big-endian). Each register is 2 bytes → data_len = count * 2.
+    The quantity requested sits at bytes [4:6] (big-endian) for both function
+    codes used here. Read Input Registers (0x04) returns 2 bytes per register;
+    Read Coils (0x01) packs 8 coils into each byte.
     """
     try:
         raw = bytes.fromhex(command_hex)
+        function_code = raw[1]
         count = (raw[4] << 8) | raw[5]
+        if function_code == 0x01:
+            return (count + 7) // 8
         return count * 2
     except Exception:
         return 0
 
 
+def _command_function_code(command_hex: str) -> int:
+    """Return the Modbus function code of a command, defaulting to 0x04."""
+    try:
+        return bytes.fromhex(command_hex)[1]
+    except Exception:
+        return 0x04
+
+
 def _read_modbus_frame(ser, expected_addr: int, expected_data_len: int,
-                       sync_timeout: float = 2.0) -> bytes:
+                       sync_timeout: float = 2.0,
+                       function_code: int = 0x04) -> bytes:
     """Read one Modbus RTU response frame with byte-level synchronisation.
 
-    Phase 1 — byte-by-byte sync on [expected_addr, 0x04]
+    Phase 1 — byte-by-byte sync on [expected_addr, function_code]
     Phase 2 — read LEN byte, validate it
     Phase 3 — read DATA + CRC, validate CRC
 
@@ -79,6 +93,8 @@ def _read_modbus_frame(ser, expected_addr: int, expected_data_len: int,
         expected_addr:      Expected slave address (e.g. 0x01).
         expected_data_len:  Expected data byte count (e.g. 36 for PIA).
         sync_timeout:       Total time to spend looking for a valid frame.
+        function_code:      Modbus function code to sync on (0x04 registers,
+                            0x01 coils).
 
     Returns:
         The complete frame including addr/cmd/len/data/crc, or b'' if
@@ -88,7 +104,7 @@ def _read_modbus_frame(ser, expected_addr: int, expected_data_len: int,
     deadline = time.monotonic() + sync_timeout
 
     while time.monotonic() < deadline:
-        # Phase 1 — find [addr, 0x04]
+        # Phase 1 — find [addr, function_code]
         addr_byte = ser.read(1)
         if not addr_byte:
             continue
@@ -98,7 +114,7 @@ def _read_modbus_frame(ser, expected_addr: int, expected_data_len: int,
         cmd_byte = ser.read(1)
         if not cmd_byte:
             continue
-        if cmd_byte[0] != 0x04:
+        if cmd_byte[0] != function_code:
             continue
 
         # Phase 2 — read LEN
@@ -128,7 +144,7 @@ def _read_modbus_frame(ser, expected_addr: int, expected_data_len: int,
             continue
 
         # Phase 3 — read data + CRC
-        frame = bytes([expected_addr, 0x04, data_len]) + ser.read(data_len + 2)
+        frame = bytes([expected_addr, function_code, data_len]) + ser.read(data_len + 2)
 
         if len(frame) < 3 + data_len + 2:
             _LOGGER.warning(
@@ -204,9 +220,10 @@ def send_serial_command(commands, port, baudrate=19200, timeout=2):
 
                 expected_addr = cmd_bytes[0]
                 expected_data_len = _expected_data_len(command)
+                function_code = _command_function_code(command)
                 _LOGGER.debug(
-                    "Expected addr=0x%02X data_len=%d",
-                    expected_addr, expected_data_len
+                    "Expected addr=0x%02X fn=0x%02X data_len=%d",
+                    expected_addr, function_code, expected_data_len
                 )
 
                 # --- Flush, write, consume echo ---
@@ -239,7 +256,8 @@ def send_serial_command(commands, port, baudrate=19200, timeout=2):
                     )
 
                 # --- Read Modbus response frame ---
-                raw = _read_modbus_frame(ser, expected_addr, expected_data_len)
+                raw = _read_modbus_frame(ser, expected_addr, expected_data_len,
+                                         function_code=function_code)
 
                 if not raw:
                     _LOGGER.warning(

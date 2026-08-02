@@ -11,6 +11,7 @@ from .const import (
     CONF_HOST,
     CONF_PORT,
     CONF_POLL_INTERVAL,
+    CONF_READ_STATUS_FLAGS,
 )
 
 
@@ -89,6 +90,7 @@ class BMSConnectorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Required("battery_address", description="Battery address", default="{}".format(self.user_input["default_address"])): str,
                 vol.Required("sensor_prefix", description="Sensor name prefix", default="{}".format(self.user_input["default_prefix"])): str,
                 vol.Optional(CONF_POLL_INTERVAL, description="Poll interval (seconds)", default=10): vol.All(vol.Coerce(int), vol.Range(min=1, max=300)),
+                vol.Optional(CONF_READ_STATUS_FLAGS, description="Read status and balancing flags", default=False): bool,
             }),
         )
 
@@ -120,6 +122,11 @@ class BMSConnectorOptionsFlowHandler(config_entries.OptionsFlow):
                 description="Poll interval (seconds)",
                 default=self._config_entry.data.get("poll_interval", 10),
             ): vol.All(vol.Coerce(int), vol.Range(min=1, max=300)),
+            vol.Optional(
+                CONF_READ_STATUS_FLAGS,
+                description="Read status and balancing flags",
+                default=self._config_entry.data.get(CONF_READ_STATUS_FLAGS, False),
+            ): bool,
         }
 
         if connection_type == "telnet":

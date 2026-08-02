@@ -2,8 +2,15 @@ from homeassistant.components.sensor import SensorEntity, SensorDeviceClass, Sen
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.const import EntityCategory
 
-from .data_parser import extract_data_from_message, build_commands_for_address, discover_bms_address
+from .data_parser import (
+    extract_data_from_message,
+    build_commands_for_address,
+    build_pic_command,
+    extract_pic_from_message,
+    discover_bms_address,
+)
 from ....connector.local_serial.seplos_v3_local_serial import send_serial_command as v3_send_serial_command
 from ....connector.local_serial.seplos_v3_local_serial import send_telnet_command as v3_send_telnet_command
 import logging
@@ -24,7 +31,8 @@ _MISSING = object()
 # ---------------------------------------------------------------------------
 
 async def generate_sensors(hass, bms_type, connector_info, config_battery_address,
-                            sensor_prefix, entry_id, async_add_entities, poll_interval=10):
+                            sensor_prefix, entry_id, async_add_entities, poll_interval=10,
+                            read_status_flags=False):
     """Génère et enregistre tous les capteurs pour UNE adresse de batterie.
 
     config_battery_address doit être un entier (ex: 1 pour l'adresse Modbus 0x01).
@@ -78,9 +86,12 @@ async def generate_sensors(hass, bms_type, connector_info, config_battery_addres
         # Construction des commandes Modbus RTU avec la bonne adresse
         # (remplace les anciennes commandes hardcodées avec adresse 0x00)
         commands = build_commands_for_address(addr_int)
+        if read_status_flags:
+            commands.append(build_pic_command(addr_int))
         _LOGGER.debug(
-            "Polling battery 0x%02X: PIA=%s | PIB=%s",
-            addr_int, commands[0], commands[1]
+            "Polling battery 0x%02X: PIA=%s | PIB=%s%s",
+            addr_int, commands[0], commands[1],
+            " | PIC=%s" % commands[2] if read_status_flags else ""
         )
 
         # Envoi — utilise le module V3 spécialisé pour Modbus RTU
@@ -135,22 +146,28 @@ async def generate_sensors(hass, bms_type, connector_info, config_battery_addres
                 )
 
         # Parsing des réponses
+        telemetry_data_str = telemetry_data_str or []
         battery_address, pia, pib, system_details, protection_settings = \
             extract_data_from_message(
-                telemetry_data_str,
+                telemetry_data_str[:2],
                 telemetry_requested=True,
                 teledata_requested=True,
                 debug=True,
                 config_battery_address=addr_int,
             )
 
-        return battery_address, pia, pib, system_details, protection_settings
+        pic = None
+        if read_status_flags and len(telemetry_data_str) > 2:
+            pic = extract_pic_from_message(telemetry_data_str[2],
+                                           config_battery_address=addr_int)
+
+        return battery_address, pia, pib, system_details, protection_settings, pic
 
     # ------------------------------------------------------------------
     # Premier appel pour initialiser le coordinator
     # ------------------------------------------------------------------
 
-    battery_address, telemetry, alarms, system_details, protection_settings = \
+    battery_address, telemetry, alarms, system_details, protection_settings, _pic = \
         await async_update_data()
 
     coordinator = DataUpdateCoordinator(
@@ -295,7 +312,41 @@ async def generate_sensors(hass, bms_type, connector_info, config_battery_addres
         ),
     ]
 
-    sensors = pia_sensors + pib_sensors
+    # ------------------------------------------------------------------
+    # Capteurs PIC (états, alarmes, équilibrage) — optionnels
+    # ------------------------------------------------------------------
+
+    pic_sensors = []
+    if read_status_flags:
+        pic_sensors = [
+            BalancingCellsSensor(
+                coordinator, connector_info, "balancing_cell_count",
+                "Balancing Cells", None, "mdi:scale-balance",
+                battery_address=battery_address, sensor_prefix=sensor_prefix,
+                entry_id=entry_id, diagnostic=True
+            )
+        ] + [
+            SeplosBMSSensorBase(
+                coordinator, connector_info, attribute, name, None, icon,
+                battery_address=battery_address, sensor_prefix=sensor_prefix,
+                entry_id=entry_id, diagnostic=True
+            )
+            for attribute, name, icon in (
+                ("system_state_code", "System State Code", "mdi:state-machine"),
+                ("fet_event_code", "FET State Code", "mdi:electric-switch"),
+                ("voltage_event_code", "Voltage Event Code", "mdi:alert-circle-outline"),
+                ("cell_temperature_event_code", "Cell Temperature Event Code",
+                 "mdi:alert-circle-outline"),
+                ("environment_power_temperature_event_code",
+                 "Environment/Power Temperature Event Code", "mdi:alert-circle-outline"),
+                ("current_event_code_1", "Current Event Code 1", "mdi:alert-circle-outline"),
+                ("current_event_code_2", "Current Event Code 2", "mdi:alert-circle-outline"),
+                ("residual_capacity_code", "Residual Capacity Code", "mdi:battery-alert"),
+                ("hard_fault_event_code", "Hard Fault Event Code", "mdi:alert-octagon"),
+            )
+        ]
+
+    sensors = pia_sensors + pib_sensors + pic_sensors
     async_add_entities(sensors, True)
 
 
@@ -317,8 +368,11 @@ class SeplosBMSSensorBase(CoordinatorEntity, SensorEntity):
         return ', '.join(triggered_alarms) if triggered_alarms else "No Alarm"
 
     def __init__(self, coordinator, port, attribute, name, unit=None,
-                 icon=None, battery_address=None, sensor_prefix=None, entry_id=None):
+                 icon=None, battery_address=None, sensor_prefix=None, entry_id=None,
+                 diagnostic=False):
         super().__init__(coordinator)
+        if diagnostic:
+            self._attr_entity_category = EntityCategory.DIAGNOSTIC
         # Entity name already includes prefix; prevent HA 2024+ from doubling.
         self._attr_has_entity_name = False
         self._port = port
@@ -384,11 +438,14 @@ class SeplosBMSSensorBase(CoordinatorEntity, SensorEntity):
         value = _MISSING
 
         if isinstance(self.coordinator.data, tuple):
-            battery_address_data, pia_data, pib_data, system_details_data, protection_settings_data = \
-                self.coordinator.data
+            data = self.coordinator.data
+            pia_data, pib_data = data[1], data[2]
+            system_details_data, protection_settings_data = data[3], data[4]
+            pic_data = data[5] if len(data) > 5 else None
             # Cherche dans PIA, puis PIB, puis les autres objets
             # Utilise _MISSING comme sentinel pour distinguer "absent" de "valeur 0"
-            for data_obj in (pia_data, pib_data, system_details_data, protection_settings_data):
+            for data_obj in (pia_data, pib_data, system_details_data,
+                             protection_settings_data, pic_data):
                 result = self.get_value(data_obj)
                 if result is not _MISSING:
                     value = result
@@ -445,3 +502,20 @@ class SeplosBMSSensorBase(CoordinatorEntity, SensorEntity):
     @property
     def icon(self):
         return self._icon
+
+
+class BalancingCellsSensor(SeplosBMSSensorBase):
+    """Number of cells currently equalising, with the cell list as an attribute."""
+
+    def _pic(self):
+        data = self.coordinator.data
+        if isinstance(data, tuple) and len(data) > 5:
+            return data[5]
+        return None
+
+    @property
+    def extra_state_attributes(self):
+        pic = self._pic()
+        if pic is None:
+            return None
+        return {"balancing_cells": pic.balancing_cells}

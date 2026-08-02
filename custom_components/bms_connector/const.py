@@ -6,6 +6,7 @@ ATTRIBUTION = "Integration for BMS via serial communication."
 
 CONF_CONNECTION_TYPE = "connection_type"
 CONF_POLL_INTERVAL = "poll_interval"
+CONF_READ_STATUS_FLAGS = "read_status_flags"
 CONF_HOST = "host"
 CONF_PORT = "port"
 

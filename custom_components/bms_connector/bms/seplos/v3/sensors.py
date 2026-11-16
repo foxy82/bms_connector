@@ -436,7 +436,14 @@ async def generate_sensors(hass, bms_type, connector_info, config_battery_addres
                     battery_address=battery_address, sensor_prefix=sensor_prefix,
                     entry_id=entry_id, modbus_address=_mb, multi_pack=multi_pack,
                     diagnostic=True
-                )
+                ),
+                SystemStateSensor(
+                    coordinator, connector_info, "system_state",
+                    "System State", None, "mdi:battery-sync",
+                    battery_address=battery_address, sensor_prefix=sensor_prefix,
+                    entry_id=entry_id, modbus_address=_mb, multi_pack=multi_pack,
+                    classify=False
+                ),
             ] + [
                 SeplosBMSSensorBase(
                     coordinator, connector_info, attribute, name, None, icon,
@@ -691,3 +698,15 @@ class BalancingCellsSensor(SeplosBMSSensorBase):
         if pic is None:
             return None
         return {"balancing_cells": pic.balancing_cells}
+
+
+class SystemStateSensor(SeplosBMSSensorBase):
+    """Readable pack state, with the equalisation state flags as an attribute."""
+
+    @property
+    def extra_state_attributes(self):
+        pack_data = self._pack_data()
+        pic = pack_data[5] if isinstance(pack_data, tuple) and len(pack_data) > 5 else None
+        if pic is None:
+            return None
+        return {"status_flags": pic.status_flags}

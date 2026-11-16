@@ -137,6 +137,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unloaded := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         hass.data[DOMAIN].pop(entry.entry_id)
+        # Drop the V3 coordinator so a reload builds entities on the new one.
+        hass.data[DOMAIN].get("coordinators", {}).pop(entry.entry_id, None)
+        hass.data[DOMAIN].get("binary_add", {}).pop(entry.entry_id, None)
     return unloaded
 
 

@@ -1,13 +1,19 @@
 from homeassistant.components.sensor import SensorEntity, SensorDeviceClass, SensorStateClass
+from homeassistant.const import EntityCategory
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.helpers.entity import DeviceInfo
 
-from .data_parser import extract_data_from_message, build_commands_for_address, discover_bms_address
+from .data_parser import (
+    build_poll_commands,
+    decode_poll_responses,
+    discover_bms_address,
+)
 from ....connector.local_serial.seplos_v3_local_serial import send_serial_command as v3_send_serial_command
 from ....connector.local_serial.seplos_v3_local_serial import send_telnet_command as v3_send_telnet_command
 import functools
 import logging
+import time
 from datetime import timedelta
 from .const import (
     ALARM_MAPPINGS,
@@ -24,91 +30,170 @@ _MISSING = object()
 # Per-attempt read budget while scanning for an unknown BMS address.
 _DISCOVERY_TIMEOUT = 2
 
+# Protection settings rarely change; re-read them this often (seconds).
+_SETTINGS_REFRESH = 3600
+
+# Index of each decoded block in a pack's data tuple.
+_PIA, _PIB, _VIA, _PIC, _SFA, _SPA = 1, 2, 3, 4, 5, 6
+
+
+def parse_battery_addresses(config_battery_address):
+    """Parse the configured battery address(es) into a list of ints.
+
+    Accepts a single address ("1", "0x01", 1) or a comma-separated list
+    ("1,2,3"). Duplicates are dropped, order is preserved, and unparseable
+    entries are skipped with a warning. Falls back to [1] if nothing usable
+    remains.
+    """
+    if isinstance(config_battery_address, (list, tuple)):
+        raw_parts = [str(p) for p in config_battery_address]
+    else:
+        raw_parts = str(config_battery_address if config_battery_address is not None
+                        else "1").split(",")
+
+    addresses = []
+    for part in raw_parts:
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            # Decimal unless explicitly hex. int(part, 0) would reject the
+            # zero-padded forms people naturally type, such as "01,02,03".
+            if part.lower().startswith(("0x", "-0x")):
+                value = int(part, 16)
+            else:
+                value = int(part, 10)
+        except ValueError:
+            _LOGGER.warning("Battery address '%s' invalid, ignoring", part)
+            continue
+        if value not in addresses:
+            addresses.append(value)
+
+    if not addresses:
+        _LOGGER.warning(
+            "No usable battery address in '%s', falling back to address 1",
+            config_battery_address,
+        )
+        addresses = [1]
+
+    return addresses
+
+
+def seplos_v3_device_info(entry_id, sensor_prefix, modbus_address, multi_pack,
+                          settings=False):
+    """Device for a V3 pack entity.
+
+    One device per pack when the entry covers several addresses, otherwise a
+    single device for the entry. Settings entities get a sibling device.
+    """
+    if multi_pack:
+        key = f"seplos_v3_{entry_id}_{modbus_address}"
+        name = f"{sensor_prefix} 0x{modbus_address:02X}"
+    else:
+        key = f"seplos_v3_{entry_id}"
+        name = f"{sensor_prefix}"
+    if settings:
+        key += "_settings"
+        name += " Settings"
+    return DeviceInfo(
+        identifiers={("bms_connector", key)},
+        name=name,
+        manufacturer="Seplos",
+        model="V3 Settings" if settings else "V3 BMS",
+        sw_version="Unknown",
+    )
+
+
+def pack_data(coordinator, modbus_address):
+    """Return a pack's decoded data tuple from the coordinator, or None."""
+    data = coordinator.data
+    if isinstance(data, dict):
+        return data.get(modbus_address)
+    return None
+
 
 # ---------------------------------------------------------------------------
 # generate_sensors
 # ---------------------------------------------------------------------------
 
 async def generate_sensors(hass, bms_type, connector_info, config_battery_address,
-                            sensor_prefix, entry_id, async_add_entities, poll_interval=10):
-    """Génère et enregistre tous les capteurs pour UNE adresse de batterie.
+                            sensor_prefix, entry_id, async_add_entities, poll_interval=10,
+                            read_status_flags=True, read_settings=True):
+    """Génère et enregistre les capteurs pour une ou plusieurs batteries.
 
-    config_battery_address doit être un entier (ex: 1 pour l'adresse Modbus 0x01).
-    Pour ajouter une seconde batterie, appeler generate_sensors une deuxième fois
-    avec config_battery_address=2 (et un sensor_prefix différent si désiré).
+    config_battery_address accepte une adresse unique ("1", "0x01", 1) ou une
+    liste séparée par des virgules ("1,2,3"). Toutes les adresses partagent un
+    seul coordinator et un seul appel transport par cycle ; chaque pack devient
+    alors un device.
+
+    read_status_flags ajoute les tables PIC et SFA, read_settings la table SPA.
+    Les blocs d'identification (VIA, modèle) ne sont lus qu'une fois par pack,
+    les réglages SPA au plus une fois par _SETTINGS_REFRESH.
     """
 
-    # ------------------------------------------------------------------
-    # Classe dérivée pour les capteurs calculés
-    # ------------------------------------------------------------------
+    addresses = parse_battery_addresses(config_battery_address)
+    multi_pack = len(addresses) > 1
+    # VIA and model are static: read until a pack has answered them once.
+    identity = {}
+    # SPA settings per pack, with the monotonic time they were read.
+    settings_cache = {}
 
-    class DerivedSeplosBMSSensor(SeplosBMSSensorBase):
-        def __init__(self, *args, **kwargs):
-            self._calc_function = kwargs.pop("calc_function", None)
-            super().__init__(*args, **kwargs)
-            self._config_battery_address = config_battery_address
+    connector_type = connector_info.get("type", "serial")
+    serial_port = connector_info.get("port")
+    serial_baud = connector_info.get("baudrate", 19200)
+    telnet_host = connector_info.get("host")
+    telnet_port = connector_info.get("port", 23)
+    telnet_timeout = connector_info.get("timeout", 8)
 
-        @property
-        def state(self):
-            if self._calc_function:
-                result = self._calc_function(self.coordinator.data)
-                _LOGGER.debug("Derived sensor '%s' calculated value: %s", self._name, result)
-                return result
-            return super().state
+    async def send(commands):
+        if connector_type == "telnet":
+            return await hass.async_add_executor_job(
+                v3_send_telnet_command, commands, telnet_host, telnet_port, telnet_timeout
+            )
+        return await hass.async_add_executor_job(
+            v3_send_serial_command, commands, serial_port, serial_baud
+        )
+
+    async def poll(active_addresses):
+        plan = []
+        for addr in active_addresses:
+            blocks = build_poll_commands(
+                addr, identity=addr not in identity,
+                status=read_status_flags,
+                settings=read_settings and (
+                    addr not in settings_cache
+                    or time.monotonic() - settings_cache[addr][1] > _SETTINGS_REFRESH
+                ),
+            )
+            plan.append((addr, blocks))
+        commands = [cmd for _, blocks in plan for _, cmd in blocks]
+        _LOGGER.debug(
+            "Polling %d battery address(es) %s using %d commands",
+            len(active_addresses), [hex(a) for a in active_addresses], len(commands)
+        )
+        responses = list(await send(commands) or [])
+        responses += [""] * (len(commands) - len(responses))
+        return plan, responses
 
     # ------------------------------------------------------------------
     # Fonction de mise à jour
     # ------------------------------------------------------------------
 
     async def async_update_data():
-        """Interroge la batterie via le bus RS485 en utilisant son adresse Modbus
-        propre (config_battery_address), puis parse les réponses.
+        """Interroge les batteries via le bus RS485 avec leur adresse Modbus
+        propre, en un seul appel transport, puis parse les réponses.
 
         IMPORTANT : on n'utilise PAS l'adresse 0x00 (broadcast) qui ferait
         répondre toutes les batteries simultanément et créerait des collisions
         sur le bus RS485.
         """
-        # Conversion en int si l'adresse est passée en string
-        if isinstance(config_battery_address, str):
-            try:
-                addr_int = int(config_battery_address, 0)  # accepte "1", "0x01", etc.
-            except ValueError:
-                addr_int = 1
-                _LOGGER.warning(
-                    "config_battery_address '%s' invalid, using default address 1",
-                    config_battery_address
-                )
-        else:
-            addr_int = int(config_battery_address)
+        active_addresses = list(addresses)
+        plan, responses = await poll(active_addresses)
 
-        # Construction des commandes Modbus RTU avec la bonne adresse
-        # (remplace les anciennes commandes hardcodées avec adresse 0x00)
-        commands = build_commands_for_address(addr_int)
-        _LOGGER.debug(
-            "Polling battery 0x%02X: PIA=%s | PIB=%s",
-            addr_int, commands[0], commands[1]
-        )
-
-        # Envoi — utilise le module V3 spécialisé pour Modbus RTU
-        # (envoi en binaire brut, pas d'ASCII)
-        connector_type = connector_info.get("type", "serial")
-        serial_port = connector_info.get("port")
-        serial_baud = connector_info.get("baudrate", 19200)
-
-        if connector_type == "telnet":
-            telnet_host = connector_info.get("host")
-            telnet_port = connector_info.get("port", 23)
-            telnet_timeout = connector_info.get("timeout", 8)
-            telemetry_data_str = await hass.async_add_executor_job(
-                v3_send_telnet_command, commands, telnet_host, telnet_port, telnet_timeout
-            )
-        else:
-            telemetry_data_str = await hass.async_add_executor_job(
-                v3_send_serial_command, commands, serial_port, serial_baud
-            )
-
-        # Auto-découverte d'adresse si la configurée ne répond pas
-        if not telemetry_data_str or not telemetry_data_str[0]:
+        # Auto-découverte d'adresse si la configurée ne répond pas, uniquement
+        # quand une seule adresse est configurée.
+        if len(active_addresses) == 1 and not responses[0]:
+            addr_int = active_addresses[0]
             _LOGGER.warning(
                 "No response from configured address 0x%02X — scanning for BMS...",
                 addr_int
@@ -124,8 +209,7 @@ async def generate_sensors(hass, bms_type, connector_info, config_battery_addres
                 scan_fn = functools.partial(v3_send_telnet_command,
                                             timeout=_DISCOVERY_TIMEOUT)
                 discovered = await hass.async_add_executor_job(
-                    discover_bms_address, scan_fn,
-                    telnet_host, telnet_port
+                    discover_bms_address, scan_fn, telnet_host, telnet_port
                 )
             else:
                 discovered = await hass.async_add_executor_job(
@@ -139,41 +223,38 @@ async def generate_sensors(hass, bms_type, connector_info, config_battery_addres
                     "configuration to address 0x%02X.",
                     discovered, addr_int, discovered, discovered
                 )
-                addr_int = discovered
-                # Réessayer avec la bonne adresse
-                commands = build_commands_for_address(addr_int)
-                if connector_type == "telnet":
-                    telemetry_data_str = await hass.async_add_executor_job(
-                        v3_send_telnet_command, commands, telnet_host, telnet_port, telnet_timeout
-                    )
-                else:
-                    telemetry_data_str = await hass.async_add_executor_job(
-                        v3_send_serial_command, commands, serial_port, serial_baud
-                    )
+                plan, responses = await poll([discovered])
+                # Entities are keyed by the configured address.
+                plan = [(addr_int, plan[0][1])]
             elif discovered is None:
                 _LOGGER.error(
                     "No BMS found on %s — check wiring and BMS address",
-                    serial_port or "unknown"
+                    telnet_host or serial_port or "unknown"
                 )
 
-        # Parsing des réponses
-        battery_address, pia, pib, via, pic, sfa, spa = \
-            extract_data_from_message(
-                telemetry_data_str,
-                telemetry_requested=True,
-                teledata_requested=True,
-                debug=True,
-                config_battery_address=addr_int,
-            )
+        results = {}
+        offset = 0
+        for addr, blocks in plan:
+            chunk = responses[offset:offset + len(blocks)]
+            offset += len(blocks)
+            if not chunk[0]:
+                _LOGGER.warning("No valid response from battery 0x%02X", addr)
+                results[addr] = (f"0x{addr:02X}", None, None, identity.get(addr),
+                                 None, None, settings_cache.get(addr, (None,))[0])
+                continue
+            data = decode_poll_responses([b for b, _ in blocks], chunk, addr)
+            if data[_VIA] is not None:
+                identity[addr] = data[_VIA]
+            if data[_SPA] is not None:
+                settings_cache[addr] = (data[_SPA], time.monotonic())
+            results[addr] = (data[:_VIA] + (identity.get(addr),) + data[_VIA + 1:_SPA]
+                             + (settings_cache.get(addr, (None,))[0],))
 
-        return battery_address, pia, pib, via, pic, sfa, spa
+        return results
 
     # ------------------------------------------------------------------
     # Premier appel pour initialiser le coordinator
     # ------------------------------------------------------------------
-
-    battery_address, telemetry, alarms, via, pic, sfa, spa = \
-        await async_update_data()
 
     coordinator = DataUpdateCoordinator(
         hass,
@@ -183,202 +264,124 @@ async def generate_sensors(hass, bms_type, connector_info, config_battery_addres
         update_interval=timedelta(seconds=poll_interval),
     )
 
-    hass.data.setdefault(DOMAIN, {}).setdefault("coordinators", {})[entry_id] = coordinator
+    _LOGGER.debug("async_refresh data generate_sensors called (addr=%s)", config_battery_address)
+    await coordinator.async_refresh()
+
+    context = {
+        "coordinator": coordinator,
+        "addresses": addresses,
+        "sensor_prefix": sensor_prefix,
+        "multi_pack": multi_pack,
+        "read_status_flags": read_status_flags,
+    }
+    hass.data.setdefault(DOMAIN, {}).setdefault("coordinators", {})[entry_id] = context
     # If the binary_sensor platform set up first, hand it the coordinator now.
     pending_binary = hass.data.get(DOMAIN, {}).get("binary_add", {}).pop(entry_id, None)
     if pending_binary is not None:
         from ....binary_sensor import build_entities
-        pending_binary(build_entities(
-            coordinator, entry_id, battery_address, sensor_prefix
-        ), True)
-    _LOGGER.debug("async_refresh data generate_sensors called (addr=%s)", config_battery_address)
-    await coordinator.async_refresh()
+        pending_binary(build_entities(context, entry_id), True)
 
-    # ------------------------------------------------------------------
-    # Définition des capteurs PIA (pack global)
-    # ------------------------------------------------------------------
+    sensors = []
+    for _mb in addresses:
+        common = {
+            "battery_address": f"0x{_mb:02X}", "sensor_prefix": sensor_prefix,
+            "entry_id": entry_id, "modbus_address": _mb, "multi_pack": multi_pack,
+        }
 
-    pia_sensors = [
-        SeplosBMSSensorBase(
-            coordinator, connector_info, "pack_voltage",
-            "Pack Voltage", "V", "mdi:flash-circle",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        ),
-        SeplosBMSSensorBase(
-            coordinator, connector_info, "current",
-            "Current", "A", "mdi:current-ac",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        ),
-        SeplosBMSSensorBase(
-            coordinator, connector_info, "remaining_capacity",
-            "Remaining Capacity", "Ah", "mdi:battery-charging-wireless",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        ),
-        SeplosBMSSensorBase(
-            coordinator, connector_info, "total_capacity",
-            "Total Capacity", "Ah", "mdi:battery",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        ),
-        SeplosBMSSensorBase(
-            coordinator, connector_info, "total_discharge_capacity",
-            "Total Discharge Capacity", "Ah", "mdi:battery-discharging",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        ),
-        SeplosBMSSensorBase(
-            coordinator, connector_info, "soc",
-            "State of Charge", "%", "mdi:gauge",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        ),
-        SeplosBMSSensorBase(
-            coordinator, connector_info, "soh",
-            "State of Health", "%", "mdi:gauge",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        ),
-        SeplosBMSSensorBase(
-            coordinator, connector_info, "cycle",
-            "Cycle", None, "mdi:numeric",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        ),
-        SeplosBMSSensorBase(
-            coordinator, connector_info, "manufacturer",
-            "Manufacturer", None, "mdi:factory",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        ),
-        SeplosBMSSensorBase(
-            coordinator, connector_info, "model",
-            "Model", None, "mdi:information-outline",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        ),
-        SeplosBMSSensorBase(
-            coordinator, connector_info, "serial",
-            "Serial Number", None, "mdi:identifier",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        ),
-        SeplosBMSSensorBase(
-            coordinator, connector_info, "avg_cell_voltage",
-            "Avg Cell Voltage", "V", "mdi:battery-20",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        ),
-        SeplosBMSSensorBase(
-            coordinator, connector_info, "avg_cell_temperature",
-            "Avg Cell Temperature", "°C", "mdi:thermometer",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        ),
-        SeplosBMSSensorBase(
-            coordinator, connector_info, "max_cell_voltage",
-            "Max Cell Voltage", "V", "mdi:battery-high",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        ),
-        SeplosBMSSensorBase(
-            coordinator, connector_info, "min_cell_voltage",
-            "Min Cell Voltage", "V", "mdi:battery-low",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        ),
-        SeplosBMSSensorBase(
-            coordinator, connector_info, "max_cell_temperature",
-            "Max Cell Temperature", "°C", "mdi:thermometer-chevron-up",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        ),
-        SeplosBMSSensorBase(
-            coordinator, connector_info, "min_cell_temperature",
-            "Min Cell Temperature", "°C", "mdi:thermometer-chevron-down",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        ),
-        SeplosBMSSensorBase(
-            coordinator, connector_info, "system_events",
-            "System Events", None, "mdi:list-status",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        ),
-        SeplosBMSSensorBase(
-            coordinator, connector_info, "extern_voltage",
-            "External Voltage", "V", "mdi:flash",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        ),
-        SeplosBMSSensorBase(
-            coordinator, connector_info, "max_discharge_current",
-            "Max Discharge Current", "A", "mdi:current-dc",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        ),
-        SeplosBMSSensorBase(
-            coordinator, connector_info, "max_charge_current",
-            "Max Charge Current", "A", "mdi:current-dc",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        ),
-    ]
+        def sensor(attribute, name, unit, icon, **kwargs):
+            return SeplosBMSSensorBase(coordinator, connector_info, attribute, name,
+                                       unit, icon, **common, **kwargs)
 
-    # ------------------------------------------------------------------
-    # Définition des capteurs PIB (cellules individuelles)
-    # ------------------------------------------------------------------
+        # --------------------------------------------------------------
+        # PIA (pack global) et VIA (identification)
+        # --------------------------------------------------------------
+        sensors += [
+            sensor("pack_voltage", "Pack Voltage", "V", "mdi:flash-circle"),
+            sensor("current", "Current", "A", "mdi:current-ac"),
+            sensor("remaining_capacity", "Remaining Capacity", "Ah",
+                   "mdi:battery-charging-wireless"),
+            sensor("total_capacity", "Total Capacity", "Ah", "mdi:battery"),
+            sensor("total_discharge_capacity", "Total Discharge Capacity", "Ah",
+                   "mdi:battery-discharging"),
+            sensor("soc", "State of Charge", "%", "mdi:gauge"),
+            sensor("soh", "State of Health", "%", "mdi:gauge"),
+            sensor("cycle", "Cycle", None, "mdi:numeric"),
+            sensor("manufacturer", "Manufacturer", None, "mdi:factory"),
+            sensor("model", "Model", None, "mdi:information-outline"),
+            sensor("serial", "Serial Number", None, "mdi:identifier"),
+            sensor("avg_cell_voltage", "Avg Cell Voltage", "V", "mdi:battery-20"),
+            sensor("avg_cell_temperature", "Avg Cell Temperature", "°C", "mdi:thermometer"),
+            sensor("max_cell_voltage", "Max Cell Voltage", "V", "mdi:battery-high"),
+            sensor("min_cell_voltage", "Min Cell Voltage", "V", "mdi:battery-low"),
+            sensor("max_cell_temperature", "Max Cell Temperature", "°C",
+                   "mdi:thermometer-chevron-up"),
+            sensor("min_cell_temperature", "Min Cell Temperature", "°C",
+                   "mdi:thermometer-chevron-down"),
+            sensor("system_events", "System Events", None, "mdi:list-status"),
+            sensor("extern_voltage", "External Voltage", "V", "mdi:flash"),
+            sensor("max_discharge_current", "Max Discharge Current", "A", "mdi:current-dc"),
+            sensor("max_charge_current", "Max Charge Current", "A", "mdi:current-dc"),
+        ]
 
-    pib_sensors = [
-        SeplosBMSSensorBase(
-            coordinator, connector_info, f"cell{i}_voltage",
-            f"Cell {i} Voltage", "V", "mdi:battery",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        )
-        for i in range(1, 17)
-    ] + [
-        SeplosBMSSensorBase(
-            coordinator, connector_info, "cell_temperature_1",
-            "Cell Temperature 1", "°C", "mdi:thermometer",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        ),
-        SeplosBMSSensorBase(
-            coordinator, connector_info, "cell_temperature_2",
-            "Cell Temperature 2", "°C", "mdi:thermometer",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        ),
-        SeplosBMSSensorBase(
-            coordinator, connector_info, "cell_temperature_3",
-            "Cell Temperature 3", "°C", "mdi:thermometer",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        ),
-        SeplosBMSSensorBase(
-            coordinator, connector_info, "cell_temperature_4",
-            "Cell Temperature 4", "°C", "mdi:thermometer",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        ),
-        SeplosBMSSensorBase(
-            coordinator, connector_info, "cell_temperature_5",
-            "Cell Temperature 5", "°C", "mdi:thermometer",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        ),
-        SeplosBMSSensorBase(
-            coordinator, connector_info, "cell_temperature_6",
-            "Cell Temperature 6", "°C", "mdi:thermometer",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        ),
-        SeplosBMSSensorBase(
-            coordinator, connector_info, "cell_temperature_7",
-            "Cell Temperature 7", "°C", "mdi:thermometer",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        ),
-        SeplosBMSSensorBase(
-            coordinator, connector_info, "cell_temperature_8",
-            "Cell Temperature 8", "°C", "mdi:thermometer",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        ),
-        SeplosBMSSensorBase(
-            coordinator, connector_info, "environment_temperature",
-            "Environment Temperature", "°C", "mdi:thermometer-lines",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        ),
-        SeplosBMSSensorBase(
-            coordinator, connector_info, "power_temperature",
-            "Power Temperature", "°C", "mdi:thermometer-lines",
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        ),
-    ]
+        # --------------------------------------------------------------
+        # PIB (cellules individuelles)
+        # --------------------------------------------------------------
+        sensors += [
+            sensor(f"cell{i}_voltage", f"Cell {i} Voltage", "V", "mdi:battery")
+            for i in range(1, 17)
+        ] + [
+            sensor(f"cell_temperature_{i}", f"Cell Temperature {i}", "°C", "mdi:thermometer")
+            for i in range(1, 9)
+        ] + [
+            sensor("environment_temperature", "Environment Temperature", "°C",
+                   "mdi:thermometer-lines"),
+            sensor("power_temperature", "Power Temperature", "°C", "mdi:thermometer-lines"),
+        ]
 
-    spa_sensors = [
-        SeplosV3SettingSensor(
-            coordinator, connector_info, field["addr"], field["name"], field["unit"],
-            battery_address=battery_address, sensor_prefix=sensor_prefix, entry_id=entry_id
-        )
-        for field in SPA_FIELDS
-    ]
+        # --------------------------------------------------------------
+        # PIC (états et alarmes)
+        # --------------------------------------------------------------
+        if read_status_flags:
+            sensors += [
+                BalancingCellsSensor(
+                    coordinator, connector_info, "balancing_cell_count",
+                    "Balancing Cells", None, "mdi:scale-balance",
+                    diagnostic=True, **common,
+                ),
+                SystemStateSensor(
+                    coordinator, connector_info, "system_state",
+                    "System State", None, "mdi:battery-sync",
+                    classify=False, **common,
+                ),
+            ] + [
+                sensor(attribute, name, None, icon, diagnostic=True, classify=False)
+                for attribute, name, icon in (
+                    ("system_state_code", "System State Code", "mdi:state-machine"),
+                    ("fet_event_code", "FET State Code", "mdi:electric-switch"),
+                    ("voltage_event_code", "Voltage Event Code", "mdi:alert-circle-outline"),
+                    ("cell_temperature_event_code", "Cell Temperature Event Code",
+                     "mdi:alert-circle-outline"),
+                    ("environment_power_temperature_event_code",
+                     "Environment/Power Temperature Event Code", "mdi:alert-circle-outline"),
+                    ("current_event_code_1", "Current Event Code 1", "mdi:alert-circle-outline"),
+                    ("current_event_code_2", "Current Event Code 2", "mdi:alert-circle-outline"),
+                    ("residual_capacity_code", "Residual Capacity Code", "mdi:battery-alert"),
+                    ("hard_fault_event_code", "Hard Fault Event Code", "mdi:alert-octagon"),
+                )
+            ]
 
-    sensors = pia_sensors + pib_sensors + spa_sensors
+        # --------------------------------------------------------------
+        # SPA (réglages de protection)
+        # --------------------------------------------------------------
+        if read_settings:
+            sensors += [
+                SeplosV3SettingSensor(
+                    coordinator, connector_info, field["addr"], field["name"],
+                    field["unit"], **common,
+                )
+                for field in SPA_FIELDS
+            ]
+
     async_add_entities(sensors, True)
 
 
@@ -401,8 +404,11 @@ class SeplosBMSSensorBase(CoordinatorEntity, SensorEntity):
 
     def __init__(self, coordinator, port, attribute, name, unit=None,
                  icon=None, battery_address=None, sensor_prefix=None, entry_id=None,
-                 settings=False):
+                 settings=False, modbus_address=None, multi_pack=False,
+                 diagnostic=False, classify=True):
         super().__init__(coordinator)
+        if diagnostic:
+            self._attr_entity_category = EntityCategory.DIAGNOSTIC
         # Entity name already includes prefix; prevent HA 2024+ from doubling.
         self._attr_has_entity_name = False
         self._port = port
@@ -412,27 +418,20 @@ class SeplosBMSSensorBase(CoordinatorEntity, SensorEntity):
         self._icon = icon
         self._battery_address = battery_address
         self._sensor_prefix = sensor_prefix
-        self._set_sensor_attributes(attribute)
+        # Bitmask codes must not be classified: _set_sensor_attributes matches on
+        # substrings, so names like "Voltage Event Code" would otherwise be
+        # published as unit-less voltage measurements.
+        if classify:
+            self._set_sensor_attributes(attribute)
         self._entry_id = entry_id
         self._settings = settings
+        # Modbus address this sensor reads from; keys the coordinator payload.
+        self._modbus_address = modbus_address
+        self._multi_pack = multi_pack
 
-        # Device info for V3 BMS (settings get their own device)
-        if settings:
-            identifiers = {("bms_connector", f"seplos_v3_{entry_id}_settings")}
-            device_name = f"{sensor_prefix} Settings"
-            model = "V3 Settings"
-        else:
-            identifiers = {("bms_connector", f"seplos_v3_{entry_id}")}
-            device_name = f"{sensor_prefix}"
-            model = "V3 BMS"
-        self._attr_device_info = DeviceInfo(
-            identifiers=identifiers,
-            name=device_name,
-            manufacturer="Seplos",
-            model=model,
-            sw_version="Unknown",
+        self._attr_device_info = seplos_v3_device_info(
+            entry_id, sensor_prefix, modbus_address, multi_pack, settings
         )
-
 
     def _set_sensor_attributes(self, attribute):
         """Set device class and state class based on sensor type."""
@@ -468,7 +467,16 @@ class SeplosBMSSensorBase(CoordinatorEntity, SensorEntity):
     @property
     def unique_id(self):
         prefix = "settings_" if self._settings else ""
+        # The Modbus address is only part of the id when an entry covers
+        # several packs.
+        if self._multi_pack:
+            return (f"bms_connector_v3_{self._entry_id}_{self._modbus_address}_"
+                    f"{prefix}{self._name}")
         return f"bms_connector_v3_{self._entry_id}_{prefix}{self._name}"
+
+    def _pack_data(self):
+        """Return this sensor's pack data tuple, or None."""
+        return pack_data(self.coordinator, self._modbus_address)
 
     @property
     def state(self):
@@ -477,17 +485,14 @@ class SeplosBMSSensorBase(CoordinatorEntity, SensorEntity):
 
         value = _MISSING
 
-        if isinstance(self.coordinator.data, tuple):
-            battery_address_data, pia_data, pib_data, via_data, pic_data, sfa_data, spa_data = \
-                self.coordinator.data
-            # Cherche dans PIA, puis PIB, puis VIA/SPA
-            for data_obj in (pia_data, pib_data, via_data, spa_data):
+        data = self._pack_data()
+        if data is not None:
+            # Cherche dans PIA, puis PIB, puis VIA/PIC/SPA
+            for data_obj in (data[_PIA], data[_PIB], data[_VIA], data[_PIC], data[_SPA]):
                 result = self.get_value(data_obj)
                 if result is not _MISSING:
                     value = result
                     break
-        else:
-            value = self.get_value(self.coordinator.data)
 
         if value is _MISSING or value is None or value == '':
             if self._attribute == 'current':
@@ -543,13 +548,11 @@ class SeplosBMSSensorBase(CoordinatorEntity, SensorEntity):
 class SeplosV3SettingSensor(SeplosBMSSensorBase):
     """Read-only SPA integer setting on the settings device."""
 
-    def __init__(self, coordinator, port, address, name, unit=None,
-                 battery_address=None, sensor_prefix=None, entry_id=None):
+    def __init__(self, coordinator, port, address, name, unit=None, **kwargs):
         self._address = address
         super().__init__(
             coordinator, port, attribute=None, name=name, unit=unit,
-            icon="mdi:tune", battery_address=battery_address,
-            sensor_prefix=sensor_prefix, entry_id=entry_id, settings=True,
+            icon="mdi:tune", settings=True, **kwargs,
         )
 
     def _set_sensor_attributes(self, attribute):
@@ -567,7 +570,29 @@ class SeplosV3SettingSensor(SeplosBMSSensorBase):
 
     @property
     def state(self):
-        data = self.coordinator.data
-        if isinstance(data, tuple) and len(data) >= 7 and data[6] is not None:
-            return data[6].values.get(self._address)
+        data = self._pack_data()
+        if data is not None and data[_SPA] is not None:
+            return data[_SPA].values.get(self._address)
         return None
+
+
+class BalancingCellsSensor(SeplosBMSSensorBase):
+    """Number of cells currently equalising, with the cell list as an attribute."""
+
+    @property
+    def extra_state_attributes(self):
+        data = self._pack_data()
+        if data is None or data[_PIC] is None:
+            return None
+        return {"balancing_cells": data[_PIC].balancing_cells}
+
+
+class SystemStateSensor(SeplosBMSSensorBase):
+    """Readable pack state, with the equalisation state flags as an attribute."""
+
+    @property
+    def extra_state_attributes(self):
+        data = self._pack_data()
+        if data is None or data[_PIC] is None:
+            return None
+        return {"status_flags": data[_PIC].status_flags}

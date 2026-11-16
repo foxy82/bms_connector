@@ -40,11 +40,13 @@
       },
       "sensor_prefix": {
         "title": "Battery and naming",
-        "description": "Battery address (DIP) and the prefix used for every entity name.",
+        "description": "Battery address (DIP) and the prefix used for every entity name. Seplos V3 accepts a comma-separated list to read a stack of packs from one entry.",
         "data": {
-          "battery_address": "Battery address",
+          "battery_address": "Battery address(es), e.g. 1 or 1,2,3 (V3)",
           "sensor_prefix": "Sensor prefix",
-          "poll_interval": "Poll interval (seconds)"
+          "poll_interval": "Poll interval (seconds)",
+          "read_status_flags": "Read status, alarm and balancing flags (V3)",
+          "read_settings": "Read protection settings (V3)"
         }
       }
     },
@@ -61,13 +63,15 @@
         "title": "Update BMS settings",
         "description": "Change the connection, battery address, naming or polling without deleting the entry.",
         "data": {
-          "battery_address": "Battery address",
+          "battery_address": "Battery address(es), e.g. 1 or 1,2,3 (V3)",
           "sensor_prefix": "Sensor prefix",
           "poll_interval": "Poll interval (seconds)",
           "connector_port": "Serial port",
           "baud_rate": "Baud rate",
           "host": "Telnet host address",
-          "port": "Telnet TCP port"
+          "port": "Telnet TCP port",
+          "read_status_flags": "Read status, alarm and balancing flags (V3)",
+          "read_settings": "Read protection settings (V3)"
         }
       }
     },

@@ -15,14 +15,14 @@ from .const import DOMAIN
 # (name, V3PICTableData attribute, device class, icon, diagnostic,
 #  attribute listing the active items as an extra state attribute)
 BINARY_SENSORS = (
-    ("Heating", "heating", BinarySensorDeviceClass.HEAT, "mdi:heating-coil", False, None),
+    ("Heating", "heating", None, "mdi:heating-coil", False, None),
     ("Charging", "charging", BinarySensorDeviceClass.BATTERY_CHARGING, None, False, None),
     ("Discharging", "discharging", None, "mdi:battery-arrow-down", False, None),
     ("Alarm", "active_alarms", BinarySensorDeviceClass.PROBLEM, None, False, "alarms"),
     ("Fault", "active_faults", BinarySensorDeviceClass.PROBLEM, None, False, "faults"),
-    ("Charge FET", "charge_fet", BinarySensorDeviceClass.POWER, "mdi:electric-switch",
+    ("Charge FET", "charge_fet", None, "mdi:electric-switch",
      True, None),
-    ("Discharge FET", "discharge_fet", BinarySensorDeviceClass.POWER, "mdi:electric-switch",
+    ("Discharge FET", "discharge_fet", None, "mdi:electric-switch",
      True, None),
     ("Current Limiting", "current_limiting", None, "mdi:speedometer-slow", True, None),
 )

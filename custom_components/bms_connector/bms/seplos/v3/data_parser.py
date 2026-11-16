@@ -720,6 +720,10 @@ def decode_pia_table(response: str):
 # PIB decoding
 # ---------------------------------------------------------------------------
 
+# Raw value of a temperature register with no sensor fitted.
+_UNFITTED_TEMPERATURE = 0x0AAB
+
+
 def decode_pib_table(response: str):
     """Decode the Modbus response to a PIB command (registers 0x1100–0x1119).
 
@@ -784,11 +788,12 @@ def decode_pib_table(response: str):
         pib.cell_temperature_3 = convert_bytes_to_data("UINT16", data[36], data[37]) * 0.1 - 273.15
         pib.cell_temperature_4 = convert_bytes_to_data("UINT16", data[38], data[39]) * 0.1 - 273.15
 
-        # Cell temperatures 5–8 (registers 0x1114–0x1117)
-        pib.cell_temperature_5 = convert_bytes_to_data("UINT16", data[40], data[41]) * 0.1 - 273.15
-        pib.cell_temperature_6 = convert_bytes_to_data("UINT16", data[42], data[43]) * 0.1 - 273.15
-        pib.cell_temperature_7 = convert_bytes_to_data("UINT16", data[44], data[45]) * 0.1 - 273.15
-        pib.cell_temperature_8 = convert_bytes_to_data("UINT16", data[46], data[47]) * 0.1 - 273.15
+        # Cell temperatures 5–8 (registers 0x1114–0x1117). Packs with four
+        # sensors report 0x0AAB (2731, i.e. 0 °C) in these reserved slots.
+        for i, offset in zip(range(5, 9), range(40, 48, 2)):
+            raw = convert_bytes_to_data("UINT16", data[offset], data[offset + 1])
+            setattr(pib, f"cell_temperature_{i}",
+                    None if raw == _UNFITTED_TEMPERATURE else raw * 0.1 - 273.15)
 
         # Environment temperature (register 0x1118)
         if len(data) >= 50:

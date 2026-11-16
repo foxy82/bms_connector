@@ -146,6 +146,119 @@ class V3PICTableData:
         """Pack heater running (FET event code, TB07 bit 3)."""
         return bool(self.fet_event_code & 0x08)
 
+    @property
+    def discharge_fet(self) -> bool:
+        return bool(self.fet_event_code & 0x01)
+
+    @property
+    def charge_fet(self) -> bool:
+        return bool(self.fet_event_code & 0x02)
+
+    @property
+    def current_limiting(self) -> bool:
+        return bool(self.fet_event_code & 0x04)
+
+    @property
+    def charging(self) -> bool:
+        return bool(self.system_state_code & 0x02)
+
+    @property
+    def discharging(self) -> bool:
+        return bool(self.system_state_code & 0x01)
+
+    @property
+    def system_state(self) -> str:
+        """Readable system state (TB09)."""
+        names = _set_bits(self.system_state_code, SYSTEM_STATE_BITS)
+        return ", ".join(names) if names else "Unknown"
+
+    @property
+    def active_alarms(self) -> list:
+        """Names of every alarm and protection currently raised."""
+        alarms = []
+        for code_attr, bits in ALARM_CODE_BITS:
+            alarms += _set_bits(getattr(self, code_attr), bits)
+        for code_attr, label, first_cell in CELL_ALARM_BYTES:
+            alarms += [f"{label} {first_cell + bit}"
+                       for bit in range(8) if getattr(self, code_attr) >> bit & 1]
+        return alarms
+
+    @property
+    def active_faults(self) -> list:
+        """Names of hardware faults currently raised (TB15)."""
+        return _set_bits(self.hard_fault_event_code, HARD_FAULT_BITS)
+
+    @property
+    def status_flags(self) -> list:
+        """Battery equalisation state code flags (TB08)."""
+        return _set_bits(self.battery_equalization_state_code, EQUALIZATION_STATE_BITS)
+
+
+def _set_bits(value: int, names: tuple) -> list:
+    """Names whose bit is set in value; None entries are reserved bits."""
+    return [name for bit, name in enumerate(names) if name and value >> bit & 1]
+
+
+# Bit tables from the Seplos V3 Modbus RTU protocol, index = bit number.
+SYSTEM_STATE_BITS = (  # TB09
+    "Discharge", "Charge", "Floating charge", "Full charge", "Standby", "Off",
+)
+EQUALIZATION_STATE_BITS = (  # TB08
+    "Low SoC alarm", "Intermittent charge", "External switch control",
+    "Static standby and sleep", "History data recording", "Under SoC protection",
+    "Active current limiting", "Passive current limiting",
+)
+HARD_FAULT_BITS = (  # TB15
+    "NTC fault", "AFE fault", "Charge MOSFET fault", "Discharge MOSFET fault",
+    "Cell fault", "Break line fault", "Key fault", "Aerosol alarm",
+)
+ALARM_CODE_BITS = (
+    ("voltage_event_code", (  # TB02
+        "Cell high voltage alarm", "Cell over voltage protection",
+        "Cell low voltage alarm", "Cell under voltage protection",
+        "Pack high voltage alarm", "Pack over voltage protection",
+        "Pack low voltage alarm", "Pack under voltage protection",
+    )),
+    ("cell_temperature_event_code", (  # TB03
+        "Charge high temperature alarm", "Charge over temperature protection",
+        "Charge low temperature alarm", "Charge under temperature protection",
+        "Discharge high temperature alarm", "Discharge over temperature protection",
+        "Discharge low temperature alarm", "Discharge under temperature protection",
+    )),
+    # TB04 bit 6 ("Cell temperature low heating") is the heater, not an alarm.
+    ("environment_power_temperature_event_code", (
+        "High environment temperature alarm",
+        "Over environment temperature protection",
+        "Low environment temperature alarm",
+        "Under environment temperature protection",
+        "High power temperature alarm", "Over power temperature protection",
+    )),
+    ("current_event_code_1", (  # TB05
+        "Charge current alarm", "Charge over current protection",
+        "Charge second level current protection", "Discharge current alarm",
+        "Discharge over current protection",
+        "Discharge second level over current protection",
+        "Output short circuit protection",
+    )),
+    ("current_event_code_2", (  # TB16
+        "Output short latch up", None, "Second charge latch up",
+        "Second discharge latch up",
+    )),
+    ("residual_capacity_code", (  # TB06
+        None, None, "SoC alarm", "SoC protection", "Cell difference alarm",
+    )),
+)
+# Per-cell alarm bytes: (attribute, label, cell number of bit 0). The PDF only
+# documents one temperature byte each, covering sensors 1-8.
+CELL_ALARM_BYTES = (
+    ("cells_01_08_undervoltage_alarm", "Low voltage cell", 1),
+    ("cells_09_16_undervoltage_alarm", "Low voltage cell", 9),
+    ("cells_01_08_overvoltage_alarm", "High voltage cell", 1),
+    ("cells_09_16_overvoltage_alarm", "High voltage cell", 9),
+    ("cell_temperature_low_alarm", "Low temperature sensor", 1),
+    ("cell_temperature_high_alarm", "High temperature sensor", 1),
+)
+
 
 def extract_pic_from_message(response_hex: str, config_battery_address: int = None):
     """Decode a PIC coil response into a V3PICTableData, or None.

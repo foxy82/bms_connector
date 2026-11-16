@@ -141,6 +141,11 @@ class V3PICTableData:
     def balancing_cell_count(self) -> int:
         return len(self.balancing_cells)
 
+    @property
+    def heating(self) -> bool:
+        """Pack heater running (FET event code, TB07 bit 3)."""
+        return bool(self.fet_event_code & 0x08)
+
 
 def extract_pic_from_message(response_hex: str, config_battery_address: int = None):
     """Decode a PIC coil response into a V3PICTableData, or None.

@@ -11,6 +11,7 @@ from .data_parser import (
     extract_pic_from_message,
     discover_bms_address,
 )
+from ....const import DOMAIN
 from ....connector.local_serial.seplos_v3_local_serial import send_serial_command as v3_send_serial_command
 from ....connector.local_serial.seplos_v3_local_serial import send_telnet_command as v3_send_telnet_command
 import functools
@@ -462,6 +463,45 @@ async def generate_sensors(hass, bms_type, connector_info, config_battery_addres
 
     async_add_entities(sensors, True)
 
+    # The binary_sensor platform is set up after this one and builds its
+    # PIC-derived entities on the same coordinator.
+    if read_status_flags:
+        hass.data[DOMAIN][status_flags_key(entry_id)] = {
+            "coordinator": coordinator,
+            "addresses": addresses,
+            "battery_addresses": initial_addresses,
+            "sensor_prefix": sensor_prefix,
+            "multi_pack": multi_pack,
+        }
+
+
+def status_flags_key(entry_id):
+    """hass.data[DOMAIN] key holding an entry's PIC coordinator context."""
+    return f"{entry_id}_v3_status_flags"
+
+
+def seplos_v3_device_info(entry_id, sensor_prefix, modbus_address, multi_pack):
+    """Device for a V3 pack entity.
+
+    One device per pack when the entry covers several addresses, otherwise a
+    single device for the entry.
+    """
+    if multi_pack and modbus_address is not None:
+        return DeviceInfo(
+            identifiers={("bms_connector", f"seplos_v3_{entry_id}_{modbus_address}")},
+            name=f"{sensor_prefix} 0x{modbus_address:02X}",
+            manufacturer="Seplos",
+            model="V3 BMS",
+            sw_version="Unknown",
+        )
+    return DeviceInfo(
+        identifiers={("bms_connector", f"seplos_v3_{entry_id}")},
+        name=f"{sensor_prefix}",
+        manufacturer="Seplos",
+        model="V3 BMS",
+        sw_version="Unknown",
+    )
+
 
 # ---------------------------------------------------------------------------
 # Classe de base des capteurs
@@ -507,24 +547,9 @@ class SeplosBMSSensorBase(CoordinatorEntity, SensorEntity):
         self._modbus_address = modbus_address
         self._multi_pack = multi_pack
 
-        # Device info for V3 BMS. One device per pack when the entry covers
-        # several addresses, otherwise a single device for the entry.
-        if multi_pack and modbus_address is not None:
-            self._attr_device_info = DeviceInfo(
-                identifiers={("bms_connector", f"seplos_v3_{entry_id}_{modbus_address}")},
-                name=f"{sensor_prefix} 0x{modbus_address:02X}",
-                manufacturer="Seplos",
-                model="V3 BMS",
-                sw_version="Unknown",
-            )
-        else:
-            self._attr_device_info = DeviceInfo(
-                identifiers={("bms_connector", f"seplos_v3_{entry_id}")},
-                name=f"{sensor_prefix}",
-                manufacturer="Seplos",
-                model="V3 BMS",
-                sw_version="Unknown",
-            )
+        self._attr_device_info = seplos_v3_device_info(
+            entry_id, sensor_prefix, modbus_address, multi_pack
+        )
 
 
     def _set_sensor_attributes(self, attribute):

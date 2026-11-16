@@ -9,6 +9,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 import homeassistant.helpers.config_validation as cv
 
+from .bms.seplos.v3.sensors import status_flags_key
 from .const import DOMAIN
 
 # Import the initialize_bms_component function from sensor.py
@@ -18,7 +19,9 @@ _LOGGER = logging.getLogger(__name__)
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
-PLATFORMS = ["sensor"]
+# Order matters: the sensor platform builds the coordinator that the
+# binary_sensor platform reuses, so it is set up first.
+PLATFORMS = ["sensor", "binary_sensor"]
 
 
 async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
@@ -98,7 +101,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await initialize_bms_component(hass, entry)
 
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    for platform in PLATFORMS:
+        await hass.config_entries.async_forward_entry_setups(entry, [platform])
     entry.async_on_unload(entry.add_update_listener(async_reload_entry))
 
     return True
@@ -107,6 +111,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unloaded := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         hass.data[DOMAIN].pop(entry.entry_id)
+        hass.data[DOMAIN].pop(status_flags_key(entry.entry_id), None)
     return unloaded
 
 

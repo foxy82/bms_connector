@@ -33,6 +33,15 @@ _DISCOVERY_TIMEOUT = 2
 # Protection settings rarely change; re-read them this often (seconds).
 _SETTINGS_REFRESH = 3600
 
+# Blocks always read in the main transport call. The others (VIA, model, SFA,
+# SPA) are not served by every firmware, so they go in a second call with a
+# short per-command deadline, and a block a pack leaves unanswered
+# _OPTIONAL_MISS_LIMIT polls in a row is skipped for _OPTIONAL_RETRY seconds.
+_CORE_BLOCKS = ("pia", "pib", "pic")
+_OPTIONAL_TIMEOUT = 2
+_OPTIONAL_MISS_LIMIT = 3
+_OPTIONAL_RETRY = 3600
+
 # Index of each decoded block in a pack's data tuple.
 _PIA, _PIB, _VIA, _PIC, _SFA, _SPA = 1, 2, 3, 4, 5, 6
 
@@ -137,6 +146,9 @@ async def generate_sensors(hass, bms_type, connector_info, config_battery_addres
     identity = {}
     # SPA settings per pack, with the monotonic time they were read.
     settings_cache = {}
+    # (pack, optional block) -> consecutive misses, and -> retry time once skipped.
+    optional_misses = {}
+    optional_skip_until = {}
 
     connector_type = connector_info.get("type", "serial")
     serial_port = connector_info.get("port")
@@ -145,35 +157,82 @@ async def generate_sensors(hass, bms_type, connector_info, config_battery_addres
     telnet_port = connector_info.get("port", 23)
     telnet_timeout = connector_info.get("timeout", 8)
 
-    async def send(commands):
+    async def send(commands, timeout=None):
+        if not commands:
+            return []
         if connector_type == "telnet":
-            return await hass.async_add_executor_job(
-                v3_send_telnet_command, commands, telnet_host, telnet_port, telnet_timeout
+            responses = await hass.async_add_executor_job(
+                v3_send_telnet_command, commands, telnet_host, telnet_port,
+                timeout or telnet_timeout
             )
-        return await hass.async_add_executor_job(
-            v3_send_serial_command, commands, serial_port, serial_baud
-        )
+        elif timeout:
+            responses = await hass.async_add_executor_job(
+                v3_send_serial_command, commands, serial_port, serial_baud, timeout
+            )
+        else:
+            responses = await hass.async_add_executor_job(
+                v3_send_serial_command, commands, serial_port, serial_baud
+            )
+        responses = list(responses or [])
+        return responses + [""] * (len(commands) - len(responses))
+
+    def wanted(addr, block):
+        retry_at = optional_skip_until.get((addr, block))
+        return retry_at is None or time.monotonic() >= retry_at
+
+    def note_optional(addr, block, answered):
+        key = (addr, block)
+        if answered:
+            optional_misses.pop(key, None)
+            optional_skip_until.pop(key, None)
+            return
+        optional_misses[key] = optional_misses.get(key, 0) + 1
+        if optional_misses[key] >= _OPTIONAL_MISS_LIMIT:
+            if key not in optional_skip_until:
+                _LOGGER.info(
+                    "Battery 0x%02X does not answer the %s block; skipping it for "
+                    "%d s", addr, block.upper(), _OPTIONAL_RETRY,
+                )
+            optional_skip_until[key] = time.monotonic() + _OPTIONAL_RETRY
+            optional_misses[key] = 0
 
     async def poll(active_addresses):
-        plan = []
+        """Poll every pack and return {addr: {block: response}}.
+
+        Core blocks for all packs go in one transport call, so the packs are
+        sampled in the same window; optional blocks follow in a second call.
+        """
+        core, optional = [], []
         for addr in active_addresses:
-            blocks = build_poll_commands(
+            for block, cmd in build_poll_commands(
                 addr, identity=addr not in identity,
                 status=read_status_flags,
                 settings=read_settings and (
                     addr not in settings_cache
                     or time.monotonic() - settings_cache[addr][1] > _SETTINGS_REFRESH
                 ),
-            )
-            plan.append((addr, blocks))
-        commands = [cmd for _, blocks in plan for _, cmd in blocks]
+            ):
+                if block in _CORE_BLOCKS:
+                    core.append((addr, block, cmd))
+                elif wanted(addr, block):
+                    optional.append((addr, block, cmd))
         _LOGGER.debug(
-            "Polling %d battery address(es) %s using %d commands",
-            len(active_addresses), [hex(a) for a in active_addresses], len(commands)
+            "Polling %d battery address(es) %s using %d + %d commands",
+            len(active_addresses), [hex(a) for a in active_addresses],
+            len(core), len(optional),
         )
-        responses = list(await send(commands) or [])
-        responses += [""] * (len(commands) - len(responses))
-        return plan, responses
+        raw = {addr: {} for addr in active_addresses}
+        core_responses = await send([cmd for _, _, cmd in core])
+        for (addr, block, _), response in zip(core, core_responses):
+            raw[addr][block] = response
+        # Skip optional reads for packs that are silent this poll.
+        optional = [item for item in optional if raw[item[0]].get("pia")]
+        optional_responses = await send([cmd for _, _, cmd in optional],
+                                        timeout=_OPTIONAL_TIMEOUT)
+        for (addr, block, _), response in zip(optional, optional_responses):
+            raw[addr][block] = response
+            note_optional(addr, block, bool(response))
+        return raw
 
     # ------------------------------------------------------------------
     # Fonction de mise à jour
@@ -188,11 +247,11 @@ async def generate_sensors(hass, bms_type, connector_info, config_battery_addres
         sur le bus RS485.
         """
         active_addresses = list(addresses)
-        plan, responses = await poll(active_addresses)
+        raw = await poll(active_addresses)
 
         # Auto-découverte d'adresse si la configurée ne répond pas, uniquement
         # quand une seule adresse est configurée.
-        if len(active_addresses) == 1 and not responses[0]:
+        if len(active_addresses) == 1 and not raw[active_addresses[0]].get("pia"):
             addr_int = active_addresses[0]
             _LOGGER.warning(
                 "No response from configured address 0x%02X — scanning for BMS...",
@@ -223,9 +282,8 @@ async def generate_sensors(hass, bms_type, connector_info, config_battery_addres
                     "configuration to address 0x%02X.",
                     discovered, addr_int, discovered, discovered
                 )
-                plan, responses = await poll([discovered])
                 # Entities are keyed by the configured address.
-                plan = [(addr_int, plan[0][1])]
+                raw = {addr_int: (await poll([discovered]))[discovered]}
             elif discovered is None:
                 _LOGGER.error(
                     "No BMS found on %s — check wiring and BMS address",
@@ -233,16 +291,13 @@ async def generate_sensors(hass, bms_type, connector_info, config_battery_addres
                 )
 
         results = {}
-        offset = 0
-        for addr, blocks in plan:
-            chunk = responses[offset:offset + len(blocks)]
-            offset += len(blocks)
-            if not chunk[0]:
+        for addr, blocks in raw.items():
+            if not blocks.get("pia"):
                 _LOGGER.warning("No valid response from battery 0x%02X", addr)
                 results[addr] = (f"0x{addr:02X}", None, None, identity.get(addr),
                                  None, None, settings_cache.get(addr, (None,))[0])
                 continue
-            data = decode_poll_responses([b for b, _ in blocks], chunk, addr)
+            data = decode_poll_responses(list(blocks), list(blocks.values()), addr)
             if data[_VIA] is not None:
                 identity[addr] = data[_VIA]
             if data[_SPA] is not None:
@@ -500,7 +555,9 @@ class SeplosBMSSensorBase(CoordinatorEntity, SensorEntity):
                     "current is None, returning 0.00 to avoid 'unknown' in HA"
                 )
                 return 0.00
-            _LOGGER.warning("No data found for %s", self._name)
+            # A silent pack is reported once per poll by the coordinator, and
+            # blocks some firmware never serves would warn on every poll.
+            _LOGGER.debug("No data found for %s", self._name)
             return None
 
         _LOGGER.debug("Sensor state %s: %s", self._name, value)
